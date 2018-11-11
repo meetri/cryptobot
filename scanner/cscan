@@ -1,0 +1,93 @@
+#!/usr/bin/env python3 -u
+
+import os,sys,json,time,argparse
+sys.path.append( os.getenv("CRYPTO_LIB","/projects/apps/shared/crypto") )
+
+import cryptolib
+from datetime import datetime
+from bson import ObjectId
+from mongowrapper import MongoWrapper
+
+parser = argparse.ArgumentParser(description='Crypto Scanner Tool')
+
+parser.add_argument('-ra','--rsi-above',nargs=1,type=int,required=False,help='rsi above specified number')
+parser.add_argument('-rb','--rsi-below',nargs=1,type=int,required=False,help='rsi below specified number')
+parser.add_argument('-va','--volume-above',nargs=1,type=int,required=False,help='volume above specified number')
+parser.add_argument('-vb','--volume-below',nargs=1,type=int,required=False,help='volume below specified number')
+parser.add_argument('-t','--trend',nargs=1,type=str,choices=['bull','bear'],required=False,help='filter by trend')
+parser.add_argument('-c','--candlesize',nargs=1,type=str,choices=['5m','15m','1h','1d'],default=['5m'],required=False,help='filter by trend')
+parser.add_argument('-m','--market',nargs=1,type=str,required=False,help='filter by market')
+parser.add_argument('-o','--output',nargs=1,type=str,required=False,default=["candle,market,candlesize,last,short.sma,rsi,vol,smavol,trend,trend.length"],help='output values as columns')
+
+args = parser.parse_args()
+
+mongo = MongoWrapper.getInstance().getClient()
+
+mscan = {
+        "scanner":"topscanner"
+        }
+
+if args.candlesize is not None:
+    mscan["candlesize"] =  args.candlesize[0]
+
+if args.market is not None:
+    mscan["market"] = { "$regex": ".*{}.*".format(args.market[0]) }
+
+if args.rsi_above is not None:
+    mscan["rsi"] = { "$gt": args.rsi_above[0] }
+
+if args.rsi_below is not None:
+    mscan["rsi"] = { "$lt": args.rsi_below[0] }
+
+if args.volume_above is not None:
+    mscan["vol"] = { "$gt": args.volume_above[0] }
+
+if args.volume_below is not None:
+    mscan["vol"] = { "$lt": args.volume_below[0] }
+
+if args.trend is not None:
+    mscan["trend"] = args.trend[0]
+
+def tableize( rows,header ):
+
+    mincol = []
+    for idx,head in enumerate(header):
+        mincol.append(len(head))
+
+    for row in rows:
+        for idx,col in enumerate(row):
+            l = mincol[idx]
+            mincol[idx] = max(len(col),l)
+            
+    for idx,head in enumerate(header):
+        print("{}".format(head.ljust(mincol[idx]+2)),end="")
+    print("")
+
+    for row in rows:
+        for idx,col in enumerate(row):
+            print("{}".format(col.ljust(mincol[idx]+2)),end="")
+        print("")
+
+class JSONEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, ObjectId):
+            return str(o)
+        return json.JSONEncoder.default(self, o)
+
+#print(mscan)
+res = mongo.crypto.scanner.find(mscan)
+items = list(res)
+#print(len(items))
+if args.output is not None:
+    if args.output[0] == "json":
+        print(JSONEncoder().encode(items))
+    else:
+        rows = []
+        headers = args.output[0].split(",")
+        for item in items:
+            cols = []
+            for col in args.output[0].split(","):
+                if col in item:
+                    cols.append( str(item[col]))
+            rows.append(cols)
+        tableize(rows,headers)

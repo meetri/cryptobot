@@ -1,0 +1,267 @@
+#!/usr/bin/env python3 -u
+import os
+import sys
+import json
+import cherrypy
+import cherrypy_cors
+
+curdir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.getenv("CRYPTO_LIB", "/projects/apps/shared/crypto"))
+import cryptolib
+from twiliosms import TwilioSms
+from mongowrapper import MongoWrapper
+from traderbot import TraderBot
+from bittrexexchange import BittrexExchange
+from bittrex import Bittrex
+from coinwatch import CoinWatch
+from genericapi import GenericApi
+from cryptocompare import CryptoCompare
+
+BOT_PORT = int(os.getenv("BOT_PORT", "9500"))
+
+
+class CoinWatchNotifier(object):
+
+    def __init__(self):
+        self.mongo = MongoWrapper.getInstance().getClient()
+        self.coinwatch = CoinWatch()
+        self.bittrex_exchange = BittrexExchange()
+        pass
+
+    def findUser(self, accountId):
+        return self.mongo.crypto.notifylist.find_one({'accountId': accountId})
+
+    def addUser(self, obj):
+        search = {"accountId": obj["accountId"]}
+        return self.mongo.crypto.notifylist.replace_one(search, obj, upsert=True)
+
+    def message(self, msg):
+        return """<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message><Body>{}</Body></Message>
+</Response>""".format(msg)
+
+
+    def validateUser(self,rcvd):
+        req = ["AccountSid", "From", "Body", "MessageSid", "MessagingServiceSid", "SmsSid",
+               "SmsMessageSid", "FromCity", "FromState", "FromZip", "FromCountry"]
+
+        for key in req:
+            if key not in rcvd:
+                return False
+
+        self.user = self.findUser( rcvd["AccountSid"] )
+        return self.user
+
+
+    def createUser(self,rcvd):
+        return self.addUser( {
+            "accountId": rcvd["AccountSid"],
+            "phone": rcvd["From"],
+            "city": rcvd["FromCity"],
+            "state": rcvd["FromState"],
+            "zipcode": rcvd["FromZip"],
+            "country": rcvd["FromCountry"],
+            })
+
+
+    @cherrypy.expose
+    def sms(self, **rcvd):
+
+        print(rcvd)
+        if not self.validateUser(rcvd):
+            print("invalid user: {}".format(rcvd))
+            return self.message("unknown")
+
+        body = rcvd["Body"].strip().lower()
+
+        if body in ["h","help"]:
+            return self.message("oo - open orders\npo - pending orders\nwl - watch list")
+        elif body in ["oo","open orders"]:
+            self.coinwatch.refresh()
+            orders = self.coinwatch.parse()
+            msg = ""
+            for order in orders:
+                msg += "{} {} @ {} @ {}%\n".format(order['market'],order['qty'], order['last'],order['dif'])
+            if len(msg) > 0:
+                msg = msg.strip()
+            else:
+                msg = "No open orders"
+            return self.message(msg)
+        elif body in ["po","pending orders"]:
+            self.coinwatch.refresh()
+            pending = self.coinwatch.parsePending()
+            msg = ""
+            for p in pending:
+                msg += "{} {} {} of {}@{}\n".format(p['exchange'],p['type'],p['remaining'],p['qty'],p['Limit'])
+            msg = msg.strip()
+            if len(msg) > 0:
+                return self.message(msg)
+            else:
+                return self.message("no pending orders")
+        elif body in ["wl", "watch list"]:
+            res = GenericApi({"apiroot": "http://cryptowatch"})
+            wl = res.process("cmd=watchlist").data
+            out = ""
+            for w in wl:
+                out += "{} @ {} rsi:{:0.2f}\n".format(w["market"], w["last"], w["rsi"])
+            out = out.strip()
+            if len(out) == 0:
+                out = "no markets in watchlist"
+            return self.message(out)
+        elif body.startswith("aw ") or body.startswith("rw "):
+            addwatch_arr = body.split(" ")
+            if len(addwatch_arr) >= 2:
+                market = addwatch_arr[1].lower()
+                if not market.startswith("btc-"):
+                    market = "btc-{}".format(market)
+                exchange = "bittrex"
+                if len(addwatch_arr) > 2:
+                    exchange = addwatch_arr[2]
+                 
+                market = market.upper()
+                if addwatch_arr[0] == "aw":
+                    
+                    watch = {"name": market, "exchange": exchange}
+                    price = None
+                    if exchange == "bittrex":
+                        bittrex = Bittrex()
+                        summary = bittrex.public_get_market_summary(market).data
+                        if summary["success"]:
+                            price = summary["result"][0]["Last"]
+                    else:
+                        cc = CryptoCompare()
+                        price = cc.lastprice(exchange,market)
+
+                    if price:
+                        watch["startprice"] = price
+                        ret = self.coinwatch.updateWatch(watch)
+                        msg = "added {} on exchange {} with price {} to watchlist".format(watch['name'], watch['exchange'],watch["startprice"])
+                    else:
+                        msg = "couldn't find {} on {}".format(market,exchange)
+                elif addwatch_arr[0] == "rw":
+                    ret = self.coinwatch.removeWatch(market, exchange)
+                    msg = "removed {} on exchange {} successfully".format(market,exchange)
+
+                if not ret.raw_result['ok']:
+                    msg = "failed to updating watchlist"
+            else:
+                msg = "invalid watch syntax"
+
+            return self.message(msg)
+        elif body.startswith("buy"):
+            # "buy 500 ocn @ last/ask/bid/amount"
+            buycmd = body.split()
+            if len(buycmd) >= 4:
+                qty = float(buycmd[1])
+                market = buycmd[2].lower()
+                if not market.startswith("btc-"):
+                    market = "btc-{}".format(market)
+                at = buycmd[3]
+                price_str = buycmd[4]
+                if at in ["@", "at"] and qty > 0:
+                    bittrex = Bittrex()
+                    summary = bittrex.public_get_market_summary(market).data
+                    if summary["success"]:
+                        if price_str in ["last", "ask", "bid"]:
+                            price = summary["result"][0][price_str.capitalize()]
+                        else:
+                            price = float(price_str)
+                            if price > 1:
+                                # convert sats to btc
+                                price = 0.00000001 * price
+
+                        buyObj = {"market": market, "qty": qty, "price": price}
+                        res = self.bittrex_exchange.buy(buyObj)
+                        resid = res["id"]
+                        msg = "created order for {} {} @ {:.08f} id: {}".format(qty, market.upper(), price, resid)
+                    else:
+                        msg = "couldn't find {} on bittrex".format(market)
+                else:
+                    msg = "buy command format incorrect"
+            else:
+                msg = "not enough parameters to buy command"
+
+            if len(msg) == 0:
+                msg = "unable to parse buy command "
+            return self.message(msg)
+
+        elif body.startswith("sell"):
+            sellcmd = body.split()
+            qty = float(sellcmd[1])
+            market = sellcmd[2]
+            at = sellcmd[3]
+            amount = float(sellcmd[4])
+            # den = sellcmd[5]
+            orders = self.coinwatch.parse()
+            msg = ""
+            oid = []
+            for order in orders:
+                if market in order['market'].lower():
+                    if qty <= order["qty"]:
+                        oid.append(order)
+                    else:
+                        return self.message("you only have {} {} available for sell".format(order['qty'],order['market']))
+
+            if amount > 1:
+                amt = 0.00000001 * amount
+            else:
+                amt = amount
+            if len(oid) == 1 and at in ["@", "at"]:
+                bot = TraderBot(name="{}-watch".format(oid[0]["market"]), config={"market": oid[0]["market"]})
+                bot.wallet.exchange = self.bittrex_exchange
+                orderObj = bot.wallet.sell(buydata={
+                    "id": "manual",
+                    "market": oid[0]["market"],
+                    "price": oid[0]["price"],
+                    "qty": qty
+                    }, price=float(amt))
+                return self.message("selling {} {} @ {} btc"
+                                    .format(qty, oid[0]["market"], amt))
+
+            if len(oid) == 0:
+                return self.message("nothing to sell")
+
+        elif body.startswith("cancel"):
+            market = body.split()[1]
+            self.coinwatch.refresh()
+            pending = self.coinwatch.parsePending()
+            cancel = None
+            for order in pending:
+                if market in order['exchange'].lower():
+                    if cancel is not None:
+                        cancel = None
+                        break
+                    else:
+                        cancel = order
+            if cancel:
+                if self.coinwatch.cancelOrder(cancel["oid"]):
+                    return self.message("order {} cancelled".format(cancel["oid"]))
+                else:
+                    return self.message("error cancelling order {}".format(cancel["oid"]))
+            else:
+                return self.message("can't find order with {} to cancel".format(market))
+
+        else:
+            return self.message("cryptowatch v0.1 alpha [{}]".format(body))
+
+
+    @cherrypy.expose
+    def index(self, cmd="help"):
+        return json.dumps({
+                "message": "what you say willis?"
+            })
+
+
+if __name__ == "__main__":
+    cherrypy_cors.install()
+    config = {'server.socket_host': '0.0.0.0', 'server.socket_port': BOT_PORT}
+    # config["environment"] = "production"
+
+    cherrypy.config.update(config)
+
+    config = {'/': {'cors.expose.on': True}}
+    try:
+        cherrypy.quickstart(CoinWatchNotifier(), config=config)
+    except (KeyboardInterrupt, SystemExit):
+        print("something really bad happened")

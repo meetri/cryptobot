@@ -1,0 +1,295 @@
+#!/usr/bin/env python3 -u
+import os
+import sys
+import json
+import time
+import traceback
+import datetime
+import cherrypy
+import cherrypy_cors
+curdir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.getenv("CRYPTO_LIB", "/projects/apps/shared/crypto"))
+import cryptolib
+from bittrex import Bittrex
+from coinwatch import CoinWatch
+from traderbot import TraderBot
+from threading import Thread
+from twiliosms import TwilioSms
+
+BOT_PORT = int(os.getenv("BOT_PORT", "9500"))
+DEFAULT_CANDLESIZE = os.getenv("CANDLESIZE", "5m")
+
+cw = CoinWatch()
+
+class CoinWatchServer(object):
+
+    def __init__(self, watchlist):
+        self.watchlist = watchlist
+
+    @cherrypy.expose
+    def index(self, cmd="help"):
+        if cmd in self.watchlist.apiInfo:
+            return self.watchlist.apiInfo[cmd]
+        else:
+            return "[]"
+
+
+class CoinWatchList(object):
+
+    def __init__(self):
+        self.bots = []
+        self.coinwatch = CoinWatch()
+        self.coinwatch.refresh()
+        self.orders = None
+
+        self.watchlist = []
+        self.notifier = {"price": {}}
+        self.sms = TwilioSms.getInstance()
+        self.notifyList = os.getenv("TRADEBOT_NOTIFY")
+
+        # threadHandler
+        self.thread = None
+
+        self.ticks = 0
+        self.eticks = 0
+        self.startDate = None
+        self.botSleep = 15
+        self.stopped = False
+
+        self.marketwatch = []
+        self.apiInfo = {
+                "help": "sorry bud, no help here.",
+                "watchlist": "[]"
+                }
+
+    def notify(self,msg):
+        if self.notifyList and len(msg) > 0:
+            nl = self.notifyList.split(",")
+            for number in nl:
+                if len(number) > 0:
+                    print("SMS: {}".format(msg))
+                    self.sms.send(msg,"+{}".format(number))
+
+    def priceNotify(self, market, last, avgprice, percentNotify=3):
+        dif = self.coinwatch.getPricePercentDif(last, avgprice)
+        if market in self.notifier["price"]:
+            lastNotified = self.notifier["price"][market]
+        else:
+            lastNotified = 0 
+            self.notifier["price"][market] = 0
+
+        if abs(dif-lastNotified) >= percentNotify:
+            self.notifier["price"][market] = dif
+            self.notify("{} is @ {:.08f} {:.02f} % difference from avg:{:.08f}".format(market, float(last), dif,float(avgprice)))
+            # self.notify("{} is @ {} {} % difference".format(market, last, dif))
+
+
+    def processRunner(self):
+        while not self.stopped:
+            try:
+                self.process()
+                self.ticks += 1
+            except Exception:
+                traceback.print_exc()
+                self.eticks += 1
+
+            time.sleep(self.botSleep)
+
+    def process(self):
+        watchlist = self.watchDetails()
+        self.apiInfo["watchlist"] = json.dumps(watchlist)
+
+
+    def start(self):
+        self.startDate = datetime.datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S')
+        self.thread = Thread(target=self.processRunner)
+        self.thread.start()
+        self.notify("botwatch started")
+
+    def stop(self):
+        self.thread.join()
+
+    def watchExist(self, name, exchange):
+        for watch in self.watchlist:
+            if watch['name'] == name and watch['exchange'] == exchange:
+                return True
+        return False
+
+    def getWatch(self, name, exchange):
+        for watch in self.watchlist:
+            if watch['name'] == name and watch['exchange'] == exchange:
+                return watch
+        # print("{}/{} not found".format(name, exchange))
+        return None
+
+    def getBot(self, name, exchange):
+        for bot in self.bots:
+            if bot.market == name and bot.exchange == exchange:
+                return bot
+
+
+    def searchMaps(self, mymap, searchmap):
+
+        for imap in mymap:
+
+            found = True
+            for key in searchmap:
+                if searchmap.get(key) != imap.get(key):
+                    found = False
+                    break
+
+            if found:
+                return imap
+
+
+
+    def getFullWatchList(self):
+        """Gather all market watches"""
+
+        if self.orders is None or self.ticks % 20 == 0:
+            self.coinwatch.refresh()
+            self.orders = self.coinwatch.parse()
+
+        self.watchlist = self.coinwatch.loadWatchList()
+        orders = self.orders.copy()
+
+        # add pending orders to watch list
+        if cw.pendingorders is not None:
+            for po in cw.pendingorders:
+                if not self.watchExist(po["Exchange"], "bittrex"):
+                    self.watchlist.append({"name": po["Exchange"], "exchange": "bittrex"})
+
+        # add all watch list items to orders list
+        for watch in self.watchlist:
+            market = watch['name']
+            exchange = watch['exchange']
+            watch['market'] = market
+            del watch['_id']
+            if not self.searchMaps(orders,{"market": market, "exchange": exchange}):
+                orders.append(cw.buildWatcher(watch))
+
+        # gather all open market positions
+        for order in orders:
+            market = order.get("market")
+            exchange = order.get("exchange")
+            if not market or not exchange:
+                continue
+            watch = self.getWatch(market, exchange)
+            bot = self.getBot(market,exchange)
+            if bot and watch:
+                cs = watch.get("candlesize") or DEFAULT_CANDLESIZE
+                if bot.candlesize != cs:
+                    self.bots.remove(bot)
+                    bot = None
+
+            if not bot:
+                order = self.searchMaps(orders,{"market": market, "exchange": exchange})
+                # if watch is None:
+                #     watch = {}
+                candlesize = DEFAULT_CANDLESIZE
+                if watch is not None:
+                    candlesize = watch.get("candlesize") or DEFAULT_CANDLESIZE
+
+                print("adding new bot for {}/{}".format(market, exchange))
+                bot = TraderBot(name="{}-watch".format(market), config={
+                    "market": market,
+                    "exchange": exchange,
+                    "candlesize": candlesize,
+                    })
+                if order.get("qty", 0) > 0:
+                    bot.wallet.createBuy(market, order["price"], order["qty"])
+                self.bots.append(bot)
+
+        return orders
+
+    def watchDetails(self):
+
+        watchlist = self.getFullWatchList()
+        for cur in watchlist:
+
+            orderSel = None
+            for order in self.orders:
+                if order["market"].lower() == cur["market"].lower():
+                    orderSel = order
+
+            # bot = self.bots[cur["market"]]
+            bot = self.getBot(cur["market"], cur["exchange"])
+            bot.process({"scrape": True})
+
+            last = bot.market_summary["Last"]
+            bbtop = bot.tadata["bband.top"][-1]
+            bbmid = bot.tadata["bband.mid"][-1]
+            bblow = bot.tadata["bband.bottom"][-1]
+            ibbtop = bot.tadata["ibband.top"][-1]
+            ibbmid = bot.tadata["ibband.mid"][-1]
+            ibblow = bot.tadata["ibband.bottom"][-1]
+
+            bbandPos = ""
+
+            if last > bbtop:
+                bbandPos = "above top bband"
+            elif last > bbmid:
+                if last > ibbtop:
+                    bbandPos = "between upper double bband"
+                else:
+                    bbandPos = "above middle bband"
+            elif last > bblow:
+                if last < ibblow:
+                    bbandPos = "between lower double bband"
+                else:
+                    bbandPos = "above lower bband"
+            elif last < bblow:
+                bbandPos = "below lower bband"
+
+            cur["candle"] = bot.csdata["time"][-1]
+            cur["candlesize"] = bot.candlesize
+            cur["rsi"] = bot.tadata["rsi"][-1]
+            cur["bband"] = bbandPos
+            cur["signal"] = bot.signals["signal"]
+            cur["score"] = bot.signals["score"]
+            if bot.candle_remaining is not None:
+                cur["remaining"] = int(bot.candle_remaining)
+            else:
+                cur["remaining"] = None
+            cur["bid"] = "{:0.8f}".format(bot.market_summary["Bid"])
+            cur["ask"] = "{:0.8f}".format(bot.market_summary["Ask"])
+            cur["last"] = "{:0.8f}".format(bot.market_summary["Last"])
+
+            orderSel = self.searchMaps(self.orders,{"market": cur["market"], "exchange": cur["exchange"]})
+            if orderSel:
+                self.priceNotify(cur["market"],cur["last"],orderSel["price"])
+
+            if cur.get("alert"):
+                alertStr = "{} - {}".format(cur.get("signal"), cur.get("bband"))
+                # print("market {} alert check for {} in {} ".format(cur["market"], cur["alert"], alertStr))
+                if cur.get("alert") in alertStr:
+                    curtime = time.time()
+                    notify = False
+                    if cur["market"] in self.notifier:
+                        if curtime - self.notifier[cur["market"]] > 60 * 30:
+                            notify = True
+                    else:
+                        notify = True
+
+                    if notify:
+                        self.notifier[cur["market"]] = curtime
+                        self.notify("{} alert triggered for {} at {}".format(cur["alert"],cur["market"],cur["last"]))
+
+
+        return watchlist
+
+
+if __name__ == "__main__":
+    cherrypy_cors.install()
+    cherrypy.config.update({'server.socket_host': '0.0.0.0', 'server.socket_port': BOT_PORT})
+
+    cwlist = CoinWatchList()
+    cwlist.start()
+
+    config = {'/':{'cors.expose.on': True}}
+    try:
+        cherrypy.quickstart ( CoinWatchServer(cwlist), config=config )
+    except (KeyboardInterrupt,SystemExit):
+        print("exiting...")
+        cwlist.stop();
+

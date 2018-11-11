@@ -1,0 +1,42 @@
+#!/usr/bin/env python3 -u
+import os
+import sys
+import json
+import fileinput
+
+def tableize(rows, columnList = []):
+    mincol = []
+    if len(rows) == 0:
+        return
+
+    for head in rows[0]:
+        mincol.append(len(head))
+
+    for row in rows:
+        for idx,head in enumerate(row):
+            col = str(row[head])
+            l = mincol[idx]
+            mincol[idx] = max(len(col),l)
+
+    for idx,head in enumerate(rows[0]):
+        print("{}".format(head.ljust(mincol[idx]+2)),end="")
+    print("")
+
+    for row in rows:
+        for idx,head in enumerate(row):
+            col = str(row[head])
+            print("{}".format(col.ljust(mincol[idx]+2)),end="")
+        print("")
+
+
+filein = ""
+for line in fileinput.input():
+    filein += line 
+
+try:
+    rows = json.loads(filein)
+    print(rows)
+except Exception as ex:
+    print(ex)
+
+# cw.tableize(out)

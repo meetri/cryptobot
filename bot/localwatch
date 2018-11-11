@@ -1,0 +1,27 @@
+#!/usr/bin/env python3 -u
+import os
+import sys
+import json
+import time
+import fileinput
+import traceback
+curdir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.getenv("CRYPTO_LIB", "/projects/apps/shared/crypto"))
+import cryptolib
+from genericapi import GenericApi
+from coinwatch import CoinWatch
+
+
+cw = CoinWatch()
+res = GenericApi({"apiroot":"http://localhost:9500"})
+
+done = False
+try:
+    watchlist = res.process("cmd=watchlist").data
+    # os.system('clear')
+    cw.tableize(watchlist)
+except KeyboardInterrupt:
+    print("")
+    done = True
+except Exception as ex:
+    traceback.print_exc()

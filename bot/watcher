@@ -1,0 +1,112 @@
+#!/usr/bin/env python3 -u
+import os
+import sys
+import json
+import time
+curdir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append(os.getenv("CRYPTO_LIB", "/projects/apps/shared/crypto"))
+import cryptolib
+from bittrex import Bittrex
+from coinwatch import CoinWatch
+from traderbot import TraderBot
+
+cw = CoinWatch()
+defaultCandlesize = "15m"
+
+bots = {}
+
+
+while True:
+    try:
+        cw.refresh()
+        watchlist = list(cw.loadWatchList())
+        out = cw.parse()
+        
+        markets = []
+        for cur in out:
+            markets.append(cur["market"])
+
+        for po in cw.pendingorders:
+            watchlist.append({"name": po["Exchange"]})
+
+        for watch in watchlist:
+            market = watch['name']
+            candlesize = watch.get("candlesize", defaultCandlesize)
+            if market not in markets:
+                out.append({
+                    "market": market,
+                    "price": 0,
+                    "qty": 0,
+                    "orders": 0,
+                    "last": 0,
+                    "bid": 0,
+                    "ask": 0,
+                    "dif": 0,
+                    "total": 0,
+                    })
+
+        for cur in out:
+            if cur["market"] not in bots:
+                bot = TraderBot(name="{}-watch".format(cur['market']), config={
+                    "market": cur["market"],
+                    "candlesize": candlesize,
+                    })
+                if cur['qty'] > 0:
+                    bot.wallet.createBuy(cur["market"], cur["price"], cur["qty"])
+                bots[cur["market"]] = bot
+
+
+        for cur in out:
+            bot = bots[cur["market"]]
+            bot.process({"scrape": True})
+
+            last = bot.market_summary["Last"]
+            bbtop = bot.tadata["bband.top"][-1]
+            bbmid = bot.tadata["bband.mid"][-1]
+            bblow = bot.tadata["bband.bottom"][-1]
+            ibbtop = bot.tadata["ibband.top"][-1]
+            ibbmid = bot.tadata["ibband.mid"][-1]
+            ibblow = bot.tadata["ibband.bottom"][-1]
+
+            bbandPos = ""
+
+            if last > bbtop:
+                bbandPos = "above top bband"
+            elif last > bbmid:
+                if last > ibbtop:
+                    bbandPos = "between upper double bband"
+                else:
+                    bbandPos = "above middle bband"
+            elif last > bblow:
+                if last < ibblow:
+                    bbandPos = "between lower double bband"
+                else:
+                    bbandPos = "above lower bband"
+            elif last < bblow:
+                bbandPos = "below lower bband"
+
+            cur["candle"] = bot.csdata["time"][-1]
+            cur["candlesize"] = bot.candlesize
+            cur["rsi"] = bot.tadata["rsi"][-1]
+            cur["bband"] = bbandPos
+            cur["signal"] = bot.signals["signal"]
+            cur["score"] = bot.signals["score"]
+            if bot.candle_remaining is not None:
+                cur["remaining"] = int(bot.candle_remaining)
+            else:
+                cur["remaining"] = None
+            #cur["lastprice"] = "{:0.8f}".format(cur["lastprice"])
+            cur["bid"] = "{:0.8f}".format(bot.market_summary["Bid"])
+            cur["ask"] = "{:0.8f}".format(bot.market_summary["Ask"])
+            cur["last"] = "{:0.8f}".format(bot.market_summary["Last"])
+            #cur["price"] = "{:0.8f}".format(bot.csdata["closed"][-1])
+            if "lastprice" in cur:
+                del cur['lastprice']
+
+
+        os.system('clear')
+        cw.tableize(out)
+        time.sleep(10)
+    except Exception as ex:
+        print(ex)
+        time.sleep(25)

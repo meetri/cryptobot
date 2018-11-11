@@ -1,0 +1,13 @@
+requests
+NumPy
+psycopg2-binary
+influxdb 
+redis 
+pg 
+ta-lib 
+flask 
+pyyaml 
+pymongo 
+cherrypy 
+cherrypy-cors 
+twilio

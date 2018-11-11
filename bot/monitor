@@ -1,0 +1,14 @@
+#!/usr/bin/env python3 -u
+import os,sys,json,time
+curdir = os.path.dirname(os.path.realpath(__file__))
+sys.path.append( os.getenv("CRYPTO_LIB","/projects/apps/shared/crypto") )
+
+import cryptolib
+from bittrex import Bittrex
+from coinwatch import CoinWatch
+
+cw = CoinWatch()
+cw.refresh()
+out = cw.parse()
+
+cw.tableize(out)
